@@ -1,0 +1,243 @@
+# OctoFetch-YAML-Version: 7
+# This file is auto-generated and managed by OctoFetch. Do not edit manually.
+name: 'Cloud Leecher Engine'
+ 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+ 
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        required: true
+        type: string
+      folder_name:
+        required: true
+        type: string
+      safe_mode:
+        required: true
+        type: string
+      chunk_size:
+        required: false
+        type: string
+        default: "90M"
+ 
+permissions:
+  contents: write
+ 
+# Prevent concurrent pushes to the same folder.
+concurrency:
+  group: leech-${{ github.event.inputs.folder_name }}
+  cancel-in-progress: false
+ 
+jobs:
+  leech:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # Sparse + partial clone. The repo can grow to many GB once a lot of
+      # downloads are committed; a regular `actions/checkout@v4` can spend
+      # several minutes just materialising the working tree before we even
+      # start the actual download. Two optimisations:
+      #   - `filter: blob:none`    -> partial clone, fetch blobs on demand only
+      #   - `sparse-checkout`      -> only `.github/` is materialised on disk;
+      #                                the heavy `downloads/` tree is skipped
+      #   - `fetch-depth: 1`       -> only the latest commit, no history
+      #
+      # Push still works because we only `git add` brand-new paths under
+      # `downloads/<folder>/`, never edit existing files.
+      - name: Checkout (sparse, fast)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github
+          sparse-checkout-cone-mode: false
+ 
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-cache-${{ runner.os }}-aria2
+ 
+      - name: Fast install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends aria2 zip coreutils
+ 
+      - name: Process File
+        env:
+          URL: ${{ github.event.inputs.file_url }}
+          FOLDER_INPUT: ${{ github.event.inputs.folder_name }}
+          SAFE_MODE: ${{ github.event.inputs.safe_mode }}
+          CHUNK_SIZE: ${{ github.event.inputs.chunk_size }}
+        run: |
+          set -euo pipefail
+ 
+          # Defensive folder-name sanitization. The C# side already caps and
+          # sanitizes, but we re-apply the same rules here so that older
+          # clients can't accidentally explode the runner with a 200+ char
+          # encrypted share token in the folder name.
+          FOLDER=$(printf '%s' "$FOLDER_INPUT" | tr -c 'A-Za-z0-9._-' '_')
+          if [ ${#FOLDER} -gt 100 ]; then
+            FOLDER="${FOLDER:0:100}"
+          fi
+          if [ -z "$FOLDER" ]; then
+            FOLDER="DL_$(date +%Y%m%d%H%M%S)"
+          fi
+          # Re-export so subsequent steps (commit) read the same value.
+          echo "FOLDER=$FOLDER" >> "$GITHUB_ENV"
+ 
+          # Sanitize and bound the source filename. Some URLs (encrypted/encoded
+          # share links) carry hundreds of characters in the path component
+          # which blow past the 255-byte filename limit on ext4. We cap the
+          # base name to a safe length and strip control characters.
+          RAW_NAME=$(basename "${URL%%\?*}" | sed 's/%20/ /g')
+          # Strip newlines/control chars (just in case).
+          RAW_NAME=$(printf '%s' "$RAW_NAME" | tr -d '\000-\037')
+ 
+          # Cap raw name at 180 bytes so name+ext+folder stay below the limit.
+          if [ ${#RAW_NAME} -gt 180 ]; then
+            RAW_NAME="${RAW_NAME:0:180}"
+          fi
+ 
+          EXT="${RAW_NAME##*.}"
+          # Cap extension at 12 chars (anything longer is almost certainly junk
+          # captured from an obfuscated URL, not a real file extension).
+          if [ ${#EXT} -gt 12 ] || [ "$EXT" = "$RAW_NAME" ]; then
+            EXT="bin"
+          fi
+ 
+          if [ "$SAFE_MODE" = "true" ]; then
+            FINAL_FILE="$FOLDER.$EXT"
+          else
+            NAME_NO_EXT="${RAW_NAME%.*}"
+            # Cap to 100 chars so the wrap_dir/<file> path is safe.
+            if [ ${#NAME_NO_EXT} -gt 100 ]; then
+              NAME_NO_EXT="${NAME_NO_EXT:0:100}"
+            fi
+            # Replace shell-meaningful chars to avoid quoting issues.
+            NAME_NO_EXT=$(printf '%s' "$NAME_NO_EXT" | tr -c 'A-Za-z0-9._-' '_')
+            if [ -z "$NAME_NO_EXT" ]; then
+              NAME_NO_EXT="$FOLDER"
+            fi
+            FINAL_FILE="$NAME_NO_EXT.$EXT"
+          fi
+ 
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+ 
+          # 16 parallel connections + 1 MB min split. Resumable, retryable,
+          # and an order of magnitude faster than single-connection curl.
+          aria2c \
+            --console-log-level=warn \
+            --summary-interval=5 \
+            --download-result=hide \
+            -x 16 -s 16 -k 1M \
+            --max-tries=5 \
+            --retry-wait=3 \
+            --connect-timeout=20 \
+            --timeout=60 \
+            --user-agent="$UA" \
+            --auto-file-renaming=false \
+            --allow-overwrite=true \
+            --check-certificate=true \
+            -o "temp_download" \
+            "$URL"
+ 
+          mkdir -p wrap_dir
+          mv "temp_download" "wrap_dir/$FINAL_FILE"
+          (
+            cd wrap_dir
+            zip -0 "../$FOLDER.zip" "$FINAL_FILE"
+          )
+ 
+          mkdir -p "downloads/$FOLDER"
+          split -b "$CHUNK_SIZE" -d -a 3 "$FOLDER.zip" "downloads/$FOLDER/chunk_"
+ 
+          (
+            cd "downloads/$FOLDER"
+            sha256sum chunk_* > checksums.sha256
+ 
+            a=1
+            for i in chunk_*; do
+              new=$(printf "%s.zip.%03d" "$FOLDER" "$a")
+              mv -- "$i" "$new"
+              a=$((a + 1))
+            done
+ 
+            # Re-create checksums with final names
+            sha256sum *.zip.* > checksums.sha256
+          )
+ 
+      - name: Commit results in batches
+        env:
+          BATCH_SIZE: 5
+        run: |
+          set -euo pipefail
+          # FOLDER is exported from the previous step via $GITHUB_ENV.
+ 
+          git config user.name "OctoFetchBot"
+          git config user.email "bot@octofetch.local"
+ 
+          # IMPORTANT: working tree is sparse-checked-out (.github only) so
+          # any path under downloads/ is "outside the sparsity definition".
+          # Disable that guard for our adds and turn off the warning.
+          git config advice.updateSparsePath false
+ 
+          # GitHub rejects single packfiles > ~2GB. To support multi-GB
+          # uploads we commit & push the chunks in small batches so each
+          # individual packfile stays well under the limit. Also bump the
+          # buffer / timeout for transient flakes.
+          git config http.postBuffer 524288000
+          git config http.lowSpeedLimit 1000
+          git config http.lowSpeedTime 600
+          git config core.compression 0
+          git config pack.windowMemory "100m"
+          git config pack.threads "1"
+ 
+          # Build the file list in deterministic order: chunks first, checksum last.
+          mapfile -t CHUNKS < <(ls "downloads/$FOLDER"/*.zip.* 2>/dev/null | sort)
+          ALL_FILES=( "${CHUNKS[@]}" "downloads/$FOLDER/checksums.sha256" )
+ 
+          TOTAL=${#ALL_FILES[@]}
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "Nothing to commit." >&2
+            exit 1
+          fi
+ 
+          push_with_retry() {
+            local label="$1"
+            for attempt in 1 2 3 4 5 6 7; do
+              git fetch origin >/dev/null 2>&1 || true
+              git pull --rebase origin "$(git rev-parse --abbrev-ref HEAD)" >/dev/null 2>&1 || true
+              if git push; then
+                echo "  ✓ $label pushed on attempt $attempt"
+                return 0
+              fi
+              backoff=$((attempt * 5))
+              echo "  · push retry in ${backoff}s ($label, attempt $attempt)..."
+              sleep "$backoff"
+            done
+            echo "  ✗ $label FAILED after 7 attempts" >&2
+            return 1
+          }
+ 
+          batch_n=0
+          for ((i=0; i<TOTAL; i+=BATCH_SIZE)); do
+            batch_n=$((batch_n + 1))
+            slice=( "${ALL_FILES[@]:i:BATCH_SIZE}" )
+            echo "▶ Batch $batch_n: ${#slice[@]} file(s)"
+ 
+            git add --sparse -- "${slice[@]}"
+            if git diff --cached --quiet; then
+              echo "  · nothing staged for batch $batch_n, skipping."
+              continue
+            fi
+ 
+            git commit -m "Add $FOLDER (batch $batch_n)"
+            push_with_retry "batch $batch_n" || exit 1
+          done
+ 
+          echo "✅ All batches pushed ($batch_n total)."
+ 
